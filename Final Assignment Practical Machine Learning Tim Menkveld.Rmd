@@ -1,0 +1,289 @@
+---
+title: "Final Assignment Practical Machine Learning"
+author: "Tim Menkveld"
+date: "10/26/2020"
+output:
+  html_document:
+    df_print: paged
+---
+Please note that my personal learning objetive is to learn TidyModels
+Learn more about tidymodels on tidymodels.com or tmwr.org (or Google Julia Silge and her YouTube channel!)
+
+### TASK / DESCRIPTION
+Six young health participants were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl
+in five different fashions: exactly according to the specification (Class A), throwing the elbows to the front (Class B),
+lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E).
+
+Class A corresponds to the specified execution of the exercise, while the other 4 classes correspond to common mistakes. 
+Participants were supervised by an experienced weight lifter to make sure the execution complied to the manner they were
+supposed to simulate. The exercises were performed by six male participants aged between 20-28 years, with little weight 
+lifting experience. We made sure that all participants could easily simulate the mistakes in a safe and controlled manner 
+by using a relatively light dumbbell (1.25kg).
+
+Read more: http://groupware.les.inf.puc-rio.br/har#ixzz6btOsq0kc
+
+
+```{r setup, include=FALSE}
+
+# Load libraries & data
+library(doParallel)
+library(skimr) 
+library(vip)
+library(tidymodels)
+library(tidyverse)
+library(caret)
+
+doParallel::registerDoParallel()
+cores <- parallel::detectCores()
+set.seed(123)
+
+pml <- read.csv("~/Downloads/pml-training.csv")
+
+
+```
+ 
+There are 160 variables and 19k rows. About equal distribution of our dependent variable 'classe', but would make sense to control for this when splitting the data. 
+
+ Column type frequency:           
+  - factor                   37    
+  - numeric                  123 
+  - A: 5580, B: 3797, E: 3607, C: 3422 
+
+ some variables only occur ~2% of times in the dataset. 
+ I exlcude these variables and when new_window = yes.
+ 
+For each model, we apply the predictions to the TEST data. So the accuracy, ROC_AUC score and confusion matrices are all performed on the test set. This means that, if a score of 70% is achieved in terms of accuracy on the test set, this model achieves this performance on out of sample data, i.e. a 30% out of sample error. 
+
+```{r data munging, include = FALSE}
+df <- pml %>% 
+  filter(new_window == 'no') %>% 
+  select(-matches("avg|max|min|stddev|var|amplitude_roll|amplitude_pitch|kurtosis|skewness|amplitude_yaw")
+         )  %>%
+  select(-raw_timestamp_part_1,
+         -raw_timestamp_part_2,
+         -cvtd_timestamp,
+         -X,
+         -num_window,
+         -user_name,
+         -new_window)
+``` 
+We end up with about 50 numeric variables, and only for rows where the new_window = 'no'.
+
+### Data split
+We use rsample to split the data into train and test, and build cross validation set on the train data.
+
+```{r datasplit}
+# We split the data (using rsample)
+init_split <- initial_split(prop = 0.75, strata = classe, data = df)
+train <- training(init_split)
+test <- testing(init_split)
+
+# We will use cross validation for the decision tree to improve generalizability. We include strata = classe to control for the amount of classes per group.
+cv_folds <- vfold_cv(train, strata = classe)
+```
+
+### SETUP UP PROJECT:
+- We will start with a simple model: Decision Tree. Trained on the TRAIN dataset
+- We will develop a Multinomial Logistic Regression and tune it's penalty parameters, trained on crossvalidation set.
+- Finally we will develop a random forest model, trained on crossvalidation set.
+ 
+- For each model, the code for how it's trained will be in the appendix to safe some space in the report.
+
+### Decision Tree
+#### We build a model, but the code is not included. The results are shown below!
+```{r decision tree, include = FALSE}
+#Data enginerering (in tidymodels we use the recipe function), this will be used throughout
+rec <- recipe(data = train, classe ~. ) %>%
+    step_normalize(all_predictors()) # I normale all predictor data
+
+#Model specifications for decision tree
+model_decision_tree <- decision_tree() %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+# We combine the recipe and model specification in the workflow. This will be used to fit the data.
+wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(model_decision_tree)
+
+# We fit the decision tree on the train data
+fitted_decision_tree <- wf %>% fit(data = train)
+
+#Let's fit the trained decision tree on the test data (by using init split) to check the performance
+test_pred_decision_tree <- last_fit(fitted_decision_tree, init_split)
+
+
+```
+
+```{r decision tree results}
+#Let's look at it's performance!
+test_pred_decision_tree %>% collect_metrics()
+
+test_pred_decision_tree %>%
+  unnest(.predictions) %>%
+  conf_mat(classe, .pred_class) 
+
+
+```
+We see that the model is not bad at identifying which classe it belongs to!
+
+### 2.Multinomial Logistic Regression
+Let's tune a multinomial logistic regression model with generalization/penalty
+We have a to add a few steps to, to indicate which parameters we want tuned and with which settings.
+
+
+#### We build a multinominal logistic regression with penalty, but the code is not included. The results of the tuning are shown below!
+
+```{r multinom_reg, include = FALSE}
+model_multinom_reg <- multinom_reg(penalty = tune()) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+
+workflow_multinom_reg <- workflow() %>%
+  add_model(model_multinom_reg) %>%
+  add_recipe(rec)
+
+# This is our grid, its basically a matrix showing which parameters to tune with which settings
+lambda_grid <- grid_regular(penalty(), levels = 50)
+
+#Tune_Grid is used instead of fit(), when we have to use the
+multinom_results <- 
+  workflow_multinom_reg %>% 
+  tune_grid(
+    resamples = cv_folds,
+    grid = lambda_grid
+  )
+
+```
+
+We plot the different performance of the different settings, the higher the mean (representing roc_auc score), the better (instead of roc_auc, we can plot accuracy).
+
+```{r multinom_results_performance, out.width = "50%"}
+multinom_results %>% 
+  collect_metrics() %>%
+  filter(.metric == 'roc_auc') %>%
+  ggplot(aes(x = penalty, y = mean)) + geom_line()
+```
+We see that the performance drops quickly! we can use 'select_best' to pick the best setting for us so we won't exactly derive the best penalty score from this graph.
+
+```{r multinom final model, include = FALSE}
+
+#To create a workflow with the best settings, we use finalize_workflow, using out workflow and 'the best roc_auc' parameter(s)
+final_multinom_reg_wf <- finalize_workflow(
+  workflow_multinom_reg,
+  multinom_results %>%  select_best("roc_auc")
+)
+
+#This last workflow is applied to all data, (I think trained on Train and then applied on Test for the metrics)
+tuned_final_multinom_reg <- last_fit(final_multinom_reg_wf,
+                            init_split)
+
+```
+
+
+```{r multinom on test data}
+#How does this model perform on TEST data?
+tuned_final_multinom_reg %>% collect_metrics()
+#tuned_final_multinom_reg %>% collect_predictions()  # call this to get the predicitons
+tuned_final_multinom_reg %>%
+  unnest(.predictions) %>%
+  conf_mat(classe, .pred_class) 
+
+```
+We see that the model has improved on some classe's over the last, but does worse on some others.
+
+### Random Forest
+
+#### We build a random forest, code is not included here for the build, but we show the tuning step and final performance.
+```{r random forest initialization, include = FALSE}
+
+# Finally, we build the random forest model. We tune different settings. 
+rand_forest_model <- rand_forest(mode = "classification", 
+                                 trees = tune(), #we want to tuse trees and min_n
+                                  min_n = tune()
+                                 ) %>%
+                     set_engine("ranger") 
+
+
+workflow_random_forest <- workflow() %>%
+    add_model(rand_forest_model) %>%
+    add_recipe(rec) # we can use the recipe specified above
+
+
+
+#The grid is specified here, we tune the parameters as specified in the rand_forest 
+tree_grid <- grid_regular(trees(),
+                          min_n(),
+                          levels = 5)
+
+#We can use the workflow to tune the grid using our grid as specified here and the cross validation sets
+tree_res <- 
+  workflow_random_forest %>% 
+  tune_grid(
+    resamples = cv_folds,
+    grid = tree_grid
+  )
+
+```
+
+#### Tuning performance
+```{r plot random forest accuracy, out.width = "50%"}
+#Plot results of the different trees
+tree_res %>% 
+  collect_metrics() %>%
+  filter(.metric == 'accuracy') %>%
+  ggplot(aes(x = trees, y = mean  , group = min_n, color = as.factor(min_n))) + geom_line()
+# We see that the performance peaks at 500 trees and at min_n of 2
+```
+We see a steep increase in performance with the number of trees, and then a slight decrease.
+Again, we use 'select_best' to pick the best one for us based on accuracy.
+
+```{r build final random forest model, include = FALSE}
+trees_res_best <- tree_res %>% select_best(metric = "accuracy") #or other metrics,
+
+# I build a new model specification, using the settings above, and ADDING improtance = impurity.
+rand_forest_model_imp <- rand_forest(mode = "classification", 
+                                 trees = 500, #we want to tuse trees and min_n
+                                 min_n = 2
+                                      ) %>%
+                        set_engine("ranger", importance = "impurity") 
+
+#This step should be redundant, but I don't know the way around at this moment.
+tuned_final_wf <- finalize_workflow(update_model(workflow_random_forest, rand_forest_model_imp),  #updated model with importance
+                                    trees_res_best) #with best tuning parameters
+
+#tuned_final_tree <- 
+#  tuned_final_wf %>%
+#  fit(data = juice(rec %>% prep() ))
+
+
+
+tuned_final_res <- last_fit(tuned_final_wf,
+                            init_split)
+```
+
+#### Final performance
+```{r random forest performace}
+#How does this model perform on TEST data?
+tuned_final_res %>% collect_metrics()
+# How does this model perform as shown by confusion matrix
+tuned_final_res %>%
+  unnest(.predictions) %>%
+  conf_mat(classe, .pred_class) 
+```
+
+It's performing too good to be true. The out of sample error is super small. 
+I'm afraid of data leakage.. but as I use the same variables in the other models this shouldn't be possible.
+To be sure, I want to check the variable importance.
+And I see indeed, that there is NOT one variable with all/most importancel.
+
+#### Variable Importance
+```{r vip randomforest, out.width = "50%"}
+tuned_final_wf %>%
+  fit(train) %>%
+  pull_workflow_fit() %>%
+  vip(geom = "col",
+      num_features = 25)
+```
+
